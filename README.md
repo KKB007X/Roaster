@@ -95,6 +95,12 @@ Round-robin sharing costs about 9% of total speed, probably because the chats us
 
 ### Reproducing
 
+To get comparable numbers, use the **same model file and quantization** as these benchmarks:
+
+> `Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf` (Qwen3.6-35B-A3B, **Q4_K_M**)
+
+A different fine-tune or quantization (Q6_K, Q8_0, IQ-quants, etc.) changes file size, SSD read volume, RAM use and speed, so results won't line up. Also use the same expert cache (`--expert-cache 64`), threads (`--threads 4`), 10 GB RAM cap and one slot.
+
 Run the server and a chat as described in the [usage guide](USAGE.md). After each reply, Roaster prints:
 
 ```

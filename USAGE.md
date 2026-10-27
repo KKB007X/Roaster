@@ -44,6 +44,8 @@ Notes:
 
 ## 3. Set your paths
 
+> **Model:** use a Qwen3.6-35B-A3B GGUF in **Q4_K_M**. The benchmarks in the [README](README.md) were run with `Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`. For results comparable to ours, use that exact file. Other quantizations and fine-tunes may load, but speed and memory use will differ.
+
 Set these once in your terminal. Use your own values:
 
 ```bash

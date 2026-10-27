@@ -1,0 +1,42 @@
+cd ~/Skippey/roaster
+
+cat > .gitignore <<'EOF'
+# Build directory and generated CMake files
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.make
+*.o
+*.o.d
+*.a
+*.so
+*.so.*
+
+# Compiled executables
+roaster
+
+# Compiled Vulkan shaders
+*.spv
+
+# Model weights and downloaded models
+*.gguf
+*.ggml
+*.safetensors
+
+# Temporary and backup files
+*.bak
+*.tmp
+*~
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+EOF

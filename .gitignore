@@ -1,55 +1,42 @@
-# Prerequisites
-*.d
+cd ~/Skippey/roaster
 
-# Object files
+cat > .gitignore <<'EOF'
+# Build directory and generated CMake files
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.make
 *.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
+*.o.d
 *.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
 *.so
 *.so.*
-*.dylib
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+# Compiled executables
+roaster
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# Compiled Vulkan shaders
+*.spv
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+# Model weights and downloaded models
+*.gguf
+*.ggml
+*.safetensors
 
-# debug information files
-*.dwo
+# Temporary and backup files
+*.bak
+*.tmp
+*~
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+EOF

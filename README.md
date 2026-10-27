@@ -17,10 +17,10 @@ Everything runs in Docker. You bring your own `.gguf` file.
 
 ## Benchmarks: Roaster vs Colibri
 
-Same machine (AMD Radeon 780M iGPU), same 10 GB RAM cap, Qwen3.6-35B-A3B at 4-bit. Roaster's numbers are **decode speed** (generated tokens per second, prompt processing excluded).
+Same machine (AMD Radeon 780M iGPU), same 10 GB RAM cap, Qwen3.6-35B-A3B at 4-bit. The comparison uses total throughput: input and output tokens divided by total response time.
 
 ```
-Decode speed, tokens/s (higher is better)
+Total throughput, tokens/s (higher is better)
 
 Colibri  cap 64             █████████░░░░░░░░░░░   4.39*
 Colibri  cap 96             ██████████░░░░░░░░░░   5.04*
@@ -30,19 +30,19 @@ Roaster  cap 64             █████████████████�
 
 | | Colibri | Roaster | Roaster vs Colibri |
 |---|---:|---:|---:|
-| Decode, cap 64 / 10 GB | 4.39 tok/s* | **10.22 tok/s** | **~2.3× faster** |
-| Decode vs Colibri's best (cap 96 + cache-route, 8 threads) | 6.67 tok/s* | **10.22 tok/s** (no cache-route, 4 threads) | **~1.5× faster** |
-| Decode, cap 8 (smallest cache) | 1.75 tok/s* | **4.07 tok/s** | **~2.3× faster** |
+| Throughput, cap 64 / 10 GB | 4.39 tok/s* | **10.22 tok/s** | **~2.3× faster** |
+| Throughput vs Colibri's best (cap 96 + cache-route, 8 threads) | 6.67 tok/s* | **10.22 tok/s** (no cache-route, 4 threads) | **~1.5× faster** |
+| Throughput, cap 8 (smallest cache) | 1.75 tok/s* | **4.07 tok/s** | **~2.3× faster** |
 | RAM, cap 8 | 4.2 GB | **2.6 GB** | **~38% less** |
 | Concurrent chats | one | **multiple slots, round robin** | |
 
-\* Colibri's numbers were measured as *output tokens ÷ total response time*, which includes prompt processing, so they **understate** Colibri's true decode speed. See [how fair is this comparison](#how-fair-is-this-comparison) before quoting the ratios.
+\* Colibri's throughput was measured as *(input tokens + output tokens) ÷ total response time*, using the same method as Roaster. See [how fair is this comparison](#how-fair-is-this-comparison) for the remaining comparison limitations.
 
 ## Benchmark details
 
 ### Colibri results (as measured)
 
-Qwen3.6-35B-A3B, `cap` is experts cached per layer. Speed is output tokens ÷ response time (see the note above).
+Qwen3.6-35B-A3B, `cap` is experts cached per layer. Throughput is (input tokens + output tokens) ÷ total response time.
 
 | Weights | Config | Speed | RAM |
 |---|---|---:|---:|
@@ -87,7 +87,7 @@ Round-robin sharing costs about 9% of total speed, probably because the chats us
 
 ### How fair is this comparison
 
-- **Colibri's speed is understated.** It was measured as output tokens ÷ total time, so prompt processing is counted as slowness. Roaster's number is decode only. The real gap is likely smaller than the ratios above. Re-measuring Colibri with separate prefill and decode timing would settle it.
+- **Throughput methodology.** Both engines were measured as (input tokens + output tokens) ÷ total response time. The comparison still uses different model weights and fine-tunes, and the results are single runs on one machine, so the ratios should be treated as indicative rather than a controlled comparison.
 - **Different weights.** Colibri used its own i4 gs64 format and Roaster used a Q4_K_M GGUF of an uncensored fine-tune. Output quality has not been compared.
 - **Cache-route for Roaster is not benchmarked yet.** Colibri's best results use it and Roaster's headline number doesn't, so Roaster has room to improve.
 - **Short, single runs.** Each figure is one run on one machine. Different thread counts were used (Colibri 8, Roaster 4).

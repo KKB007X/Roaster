@@ -1,4 +1,0 @@
-/home/kkb007x/Skippey/roaster/build/CMakeFiles/roaster_shaders.dir
-/home/kkb007x/Skippey/roaster/build/CMakeFiles/roaster.dir
-/home/kkb007x/Skippey/roaster/build/CMakeFiles/edit_cache.dir
-/home/kkb007x/Skippey/roaster/build/CMakeFiles/rebuild_cache.dir

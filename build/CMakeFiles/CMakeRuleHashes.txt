@@ -1,0 +1,4 @@
+# Hashes of file build rules.
+8196d1e0221fa270414c8f532a25665c CMakeFiles/roaster_shaders
+0c04f683cedffe3b60c05825198acf22 shaders/q4k_matvec.spv
+1e25b53a9ea5a07acf4f447fc39b445e shaders/q6k_matvec.spv

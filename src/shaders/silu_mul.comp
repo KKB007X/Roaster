@@ -1,0 +1,31 @@
+#version 450
+// Fused-MoE middle stage:  eh[e][j] = silu(gate[e][j]) * up[e][j]
+// Reads the gate/up matvec outputs and writes the inputs of the down projections, all inside
+// the same command buffer (so the CPU is not involved between gate/up and down).
+//
+// Layout of the shared scratch buffer, in floats, with stride = padded floats per expert row:
+//   gate/up region (binding 0):  gate[e] at (2e)*stride, up[e] at (2e+1)*stride
+//   eh region      (binding 2):  eh[e]   at e*stride
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer GateUpBuffer { float data[]; } gu;
+layout(std430, set = 0, binding = 2) writeonly buffer EhBuffer { float data[]; } eh;
+
+layout(push_constant) uniform Params {
+    uint inter;    // elements per expert (512)
+    uint n;        // number of experts (routed + shared)
+    uint stride;   // padded floats between rows
+} p;
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n * p.inter)
+        return;
+    uint e = idx / p.inter;
+    uint j = idx - e * p.inter;
+    float g = gu.data[(2u * e) * p.stride + j];
+    float u = gu.data[(2u * e + 1u) * p.stride + j];
+    eh.data[e * p.stride + j] = (g / (1.0 + exp(-g))) * u;
+}

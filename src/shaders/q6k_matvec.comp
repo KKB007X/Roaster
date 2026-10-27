@@ -1,0 +1,118 @@
+#version 450
+// Q6_K matrix-vector product, drop-in replacement (same bindings / push constants as before).
+// 64 threads per workgroup, ROWS_PER_WG = 16 rows (4 threads per row) - host constant stays 16.
+//
+// Each thread handles 16 of the 32 'l' positions of one 128-weight half of a block: it reads
+// three 16-byte chunks (ql, ql+32, qh) with one helper that also copes with the 2-byte
+// misalignment of odd blocks (a Q6_K block is 210 bytes). The input vector is staged once per
+// workgroup in shared memory (tiles of 8 blocks = 2048 columns).
+// Requires cols % 256 == 0 (the host falls back to the CPU kernels otherwise).
+
+layout(local_size_x = 64) in;
+
+#define ROWS_PER_WG 16
+#define TILE_BLOCKS 8
+
+layout(std430, set = 0, binding = 0) readonly buffer WeightBuffer { uint data[]; } weights;
+layout(std430, set = 0, binding = 1) readonly buffer VectorBuffer { vec4 data[]; } inputVector;
+layout(std430, set = 0, binding = 2) writeonly buffer OutputBuffer { float data[]; } outputVector;
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    uint blocksPerRow;
+} p;
+
+shared vec4 xs[TILE_BLOCKS * 64];
+shared float partial[64];
+
+// 16 bytes starting at byteOff (which is a multiple of 2).
+uvec4 ld16(uint byteOff)
+{
+    uint w = byteOff >> 2;
+    if ((byteOff & 2u) == 0u)
+        return uvec4(weights.data[w], weights.data[w + 1u], weights.data[w + 2u], weights.data[w + 3u]);
+    uint a = weights.data[w];
+    uint b = weights.data[w + 1u];
+    uint c = weights.data[w + 2u];
+    uint d = weights.data[w + 3u];
+    uint e = weights.data[w + 4u];
+    return uvec4((a >> 16) | (b << 16), (b >> 16) | (c << 16),
+                 (c >> 16) | (d << 16), (d >> 16) | (e << 16));
+}
+
+float sbyte(uint o)
+{
+    uint v = (weights.data[o >> 2] >> ((o & 3u) * 8u)) & 255u;
+    return float(int(v << 24) >> 24);
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row = wg * ROWS_PER_WG + (tid >> 2);
+    uint sub = tid & 3u;
+    uint n = sub >> 1;            // which 128-weight half of the block
+    uint h = sub & 1u;            // l in [16h, 16h+16)  (also the scale-index offset l/16)
+    bool valid = row < p.rows;
+    uint nb = p.blocksPerRow;
+    uint rowByte = row * nb * 210u;
+
+    float sum = 0.0;
+    for (uint tb = 0u; tb < nb; tb += TILE_BLOCKS) {
+        uint nblk = min(uint(TILE_BLOCKS), nb - tb);
+        barrier();
+        uint tv = nblk * 64u;
+        uint base4 = tb * 64u;
+        for (uint i = tid; i < tv; i += 64u)
+            xs[i] = inputVector.data[base4 + i];
+        barrier();
+        if (valid) {
+            for (uint lb = 0u; lb < nblk; ++lb) {
+                uint blk = rowByte + (tb + lb) * 210u;
+                uvec4 A = ld16(blk + 64u * n + 16u * h);            // ql[l .. l+15]
+                uvec4 B = ld16(blk + 64u * n + 32u + 16u * h);      // ql[l+32 .. l+47]
+                uvec4 H = ld16(blk + 128u + 32u * n + 16u * h);     // qh[l .. l+15]
+                uint sb = blk + 192u + 8u * n + h;
+                float s1 = sbyte(sb);
+                float s2 = sbyte(sb + 2u);
+                float s3 = sbyte(sb + 4u);
+                float s4 = sbyte(sb + 6u);
+                uint dOff = blk + 208u;
+                float d = unpackHalf2x16((weights.data[dOff >> 2] >> ((dOff & 2u) * 8u)) & 0xFFFFu).x;
+                uint xi = lb * 64u + n * 32u + h * 4u;
+                float t1 = 0.0, t2 = 0.0, t3 = 0.0, t4 = 0.0;
+                for (uint w = 0u; w < 4u; ++w) {
+                    uint a = A[w];
+                    uint b = B[w];
+                    uint hh = H[w];
+                    vec4 q1, q2, q3, q4;
+                    for (uint j = 0u; j < 4u; ++j) {
+                        uint sh = 8u * j;
+                        uint ab = (a >> sh) & 255u;
+                        uint bb = (b >> sh) & 255u;
+                        uint hb = (hh >> sh) & 255u;
+                        q1[j] = float(int((ab & 15u) | ((hb & 3u) << 4)) - 32);
+                        q2[j] = float(int((bb & 15u) | (((hb >> 2) & 3u) << 4)) - 32);
+                        q3[j] = float(int((ab >> 4) | (((hb >> 4) & 3u) << 4)) - 32);
+                        q4[j] = float(int((bb >> 4) | (((hb >> 6) & 3u) << 4)) - 32);
+                    }
+                    t1 += dot(q1, xs[xi + w]);
+                    t2 += dot(q2, xs[xi + 8u + w]);
+                    t3 += dot(q3, xs[xi + 16u + w]);
+                    t4 += dot(q4, xs[xi + 24u + w]);
+                }
+                sum += d * (s1 * t1 + s2 * t2 + s3 * t3 + s4 * t4);
+            }
+        }
+    }
+    partial[tid] = sum;
+    barrier();
+    if (sub == 0u && valid) {
+        float t = 0.0;
+        for (uint i = 0u; i < 4u; ++i)
+            t += partial[tid + i];
+        outputVector.data[row] = t;
+    }
+}

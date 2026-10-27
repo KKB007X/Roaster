@@ -1,0 +1,111 @@
+#version 450
+// Q4_K matrix-vector product, drop-in replacement (same bindings / push constants as before).
+// 64 threads per workgroup, ROWS_PER_WG = 8 rows (8 threads per row) - host constant stays 8.
+//
+// Differences from the old shader:
+//  * the input vector is staged once per workgroup in shared memory (tiles of 8 blocks = 2048
+//    columns), instead of every thread re-reading ~8x more vector bytes than weight bytes;
+//  * the 8 threads of a row walk the SAME block together, each loading one 16-byte qs chunk, so a
+//    row's 144-byte block is read as one contiguous, coalesced access;
+//  * min/scale terms are folded:  sum((d*sc*q - dmin*m)*x) = d*sc*sum(q*x) - dmin*m*sum(x).
+// Requires cols % 256 == 0 (the host falls back to the CPU kernels otherwise).
+
+layout(local_size_x = 64) in;
+
+#define ROWS_PER_WG 8
+#define TILE_BLOCKS 8
+
+layout(std430, set = 0, binding = 0) readonly buffer WeightBuffer { uvec4 data[]; } weights;
+layout(std430, set = 0, binding = 1) readonly buffer VectorBuffer { vec4 data[]; } inputVector;
+layout(std430, set = 0, binding = 2) writeonly buffer OutputBuffer { float data[]; } outputVector;
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    uint blocksPerRow;
+} p;
+
+shared vec4 xs[TILE_BLOCKS * 64];
+shared float partial[64];
+
+uint sbyte(uvec3 s, uint i)
+{
+    return (s[i >> 2] >> ((i & 3u) * 8u)) & 255u;
+}
+
+void scaleMin(uvec3 s, uint j, out float sc, out float mn)
+{
+    uint a;
+    uint b;
+    if (j < 4u) {
+        a = sbyte(s, j) & 63u;
+        b = sbyte(s, j + 4u) & 63u;
+    } else {
+        uint v = sbyte(s, j + 4u);
+        a = (v & 15u) | ((sbyte(s, j - 4u) >> 6) << 4);
+        b = (v >> 4) | ((sbyte(s, j) >> 6) << 4);
+    }
+    sc = float(a);
+    mn = float(b);
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row = wg * ROWS_PER_WG + (tid >> 3);
+    uint sub = tid & 7u;          // which 16-byte qs chunk of the block
+    uint g = sub >> 1;            // 64-weight group inside the block
+    uint h = sub & 1u;            // first / second 16 bytes of the group's 32 bytes
+    bool valid = row < p.rows;
+    uint nb = p.blocksPerRow;
+    uint rowUnit = row * nb * 9u; // 9 uvec4 per 144-byte block
+
+    float sum = 0.0;
+    for (uint tb = 0u; tb < nb; tb += TILE_BLOCKS) {
+        uint nblk = min(uint(TILE_BLOCKS), nb - tb);
+        barrier();
+        uint tv = nblk * 64u;
+        uint base4 = tb * 64u;
+        for (uint i = tid; i < tv; i += 64u)
+            xs[i] = inputVector.data[base4 + i];
+        barrier();
+        if (valid) {
+            for (uint lb = 0u; lb < nblk; ++lb) {
+                uint unit = rowUnit + (tb + lb) * 9u;
+                uvec4 hdr = weights.data[unit];
+                uvec4 q = weights.data[unit + 1u + sub];
+                vec2 dd = unpackHalf2x16(hdr.x);   // d, dmin
+                uvec3 s = hdr.yzw;                 // 12 packed scale bytes
+                float scLo, mnLo, scHi, mnHi;
+                scaleMin(s, 2u * g, scLo, mnLo);
+                scaleMin(s, 2u * g + 1u, scHi, mnHi);
+                uint xi = lb * 64u + g * 16u + h * 4u;
+                float qlo = 0.0, qhi = 0.0, xlo = 0.0, xhi = 0.0;
+                for (uint w = 0u; w < 4u; ++w) {
+                    uint v = q[w];
+                    vec4 lo = vec4(float(v & 15u), float((v >> 8) & 15u),
+                                   float((v >> 16) & 15u), float((v >> 24) & 15u));
+                    vec4 hi = vec4(float((v >> 4) & 15u), float((v >> 12) & 15u),
+                                   float((v >> 20) & 15u), float((v >> 28) & 15u));
+                    vec4 xl = xs[xi + w];
+                    vec4 xh = xs[xi + 8u + w];
+                    qlo += dot(lo, xl);
+                    qhi += dot(hi, xh);
+                    xlo += xl.x + xl.y + xl.z + xl.w;
+                    xhi += xh.x + xh.y + xh.z + xh.w;
+                }
+                sum += dd.x * scLo * qlo - dd.y * mnLo * xlo
+                     + dd.x * scHi * qhi - dd.y * mnHi * xhi;
+            }
+        }
+    }
+    partial[tid] = sum;
+    barrier();
+    if (sub == 0u && valid) {
+        float t = 0.0;
+        for (uint i = 0u; i < 8u; ++i)
+            t += partial[tid + i];
+        outputVector.data[row] = t;
+    }
+}

@@ -1,16 +1,37 @@
 # Roaster usage guide
 
-How to build, run and tune Roaster with Docker. For what Roaster is and how it performs, see the [README](README.md).
+How to install, run and tune Roaster with Docker. For what Roaster is and how it performs, see the [README](README.md).
 
 ---
 
-## 1. Build
+## 1. Choose how to install Roaster
+
+You can either pull the prebuilt Docker image (no repository clone or local compilation), or build it yourself from source.
+
+### Option A — Pull the prebuilt image (recommended)
+
+The published image is hosted on GitHub Container Registry:
 
 ```bash
-git clone <repo-url> roaster
-cd roaster
-docker build -t roaster:dev .
+docker pull ghcr.io/kkb007x/roaster:latest
+export ROASTER_IMAGE=ghcr.io/kkb007x/roaster:latest
 ```
+
+This downloads the Roaster Docker image only. You do **not** need to clone this repository, install CMake, or compile anything. You still need Docker and your own supported GGUF model file.
+
+### Option B — Build from source
+
+```bash
+git clone https://github.com/KKB007X/Roaster.git
+cd Roaster
+docker build -t roaster:dev .
+export ROASTER_IMAGE=roaster:dev
+```
+
+The remaining commands use `$ROASTER_IMAGE`, so they work with either installation method.
+
+---
+
 
 ## 2. Find your GPU
 
@@ -105,7 +126,7 @@ Good to know:
 
   ```bash
   echo "Explain mmap in two sentences" | docker run --rm -i -v "$SOCK_DIR":/run/roaster \
-    roaster:dev chat --socket /run/roaster/roaster.sock --think 0 2>/dev/null
+    $ROASTER_IMAGE chat --socket /run/roaster/roaster.sock --think 0 2>/dev/null
   ```
 
 ---

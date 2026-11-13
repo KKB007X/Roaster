@@ -91,7 +91,7 @@ docker run --rm -it --name roaster \
   -e OMP_NUM_THREADS=4 -e OMP_DYNAMIC=FALSE -e OMP_WAIT_POLICY=passive \
   -v "$MODEL_DIR":/models:ro \
   -v "$SOCK_DIR":/run/roaster \
-  roaster:dev \
+  $ROASTER_IMAGE \
   serve --model "/models/$MODEL_FILE" \
         --expert-cache 64 --max-slots 4 --threads 4 \
         --socket /run/roaster/roaster.sock

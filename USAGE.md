@@ -109,7 +109,7 @@ Adjust to your machine:
 In another terminal. You can open several, up to `--max-slots`:
 
 ```bash
-docker run --rm -it -v "$SOCK_DIR":/run/roaster roaster:dev \
+docker run --rm -it -v "$SOCK_DIR":/run/roaster $ROASTER_IMAGE \
   chat --socket /run/roaster/roaster.sock \
        --cache-route 1 --temp 0.3 --max-tokens 512 --context 8192 --think 0
 ```

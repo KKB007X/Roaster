@@ -75,7 +75,7 @@ static void render_byte(Render *r, int ch)
     }
 }
 
-int client_run(const char *socket_path, const SlotConfig *c, int color)
+int client_run(const char *socket_path, const SlotConfig *c, int color, const char *system)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     if (strlen(socket_path) >= sizeof(addr.sun_path)) {
@@ -91,9 +91,10 @@ int client_run(const char *socket_path, const SlotConfig *c, int color)
     FILE *in = fdopen(dup(fd), "r");
     FILE *out = fdopen(fd, "w");
 
-    fprintf(out, "CREATE %zu %d %d %d %.9g %.9g %.9g %.9g %d %d %d\n",
+    fprintf(out, "CREATE %zu %d %d %d %.9g %.9g %.9g %.9g %d %d %d %d %d\n",
             c->context_length, c->cache_route, c->route_j, c->route_m, c->route_alpha,
-            c->route_p, c->temperature, c->top_p, c->top_k, c->max_tokens, c->think);
+            c->route_p, c->temperature, c->top_p, c->top_k, c->max_tokens, c->think,
+            c->slide, c->keep);
     fflush(out);
 
     char reply[512];
@@ -104,6 +105,21 @@ int client_run(const char *socket_path, const SlotConfig *c, int color)
     if (strncmp(reply, "OK ", 3) != 0) {
         fprintf(stderr, "Server: %s", reply);
         return 1;
+    }
+    if (system && system[0]) {                    /* SYS <escaped text> */
+        fputs("SYS ", out);
+        for (const char *p = system; *p; p++) {
+            if (*p == '\n') fputs("\\n", out);
+            else if (*p == '\r') fputs("\\r", out);
+            else if (*p == '\\') fputs("\\\\", out);
+            else fputc(*p, out);
+        }
+        fputc('\n', out);
+        fflush(out);
+        if (!fgets(reply, sizeof(reply), in) || strncmp(reply, "OK", 2) != 0) {
+            fprintf(stderr, "Server rejected the system prompt: %s", reply);
+            return 1;
+        }
     }
     int tty = isatty(STDIN_FILENO);
     if (color < 0)

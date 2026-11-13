@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "weights.h"
+#include "kvspill.h"
 
 #define MODEL_HIDDEN_SIZE        2048
 #define MODEL_VOCAB_SIZE         248320
@@ -74,8 +75,18 @@ typedef struct {
     float route_alpha;
     float route_p;
 
-    /* Current sequence position. */
+    /* Absolute sequence position: RoPE position = total tokens processed since the last reset.
+     * It keeps growing when the attention window slides. */
     size_t position;
+
+    /* Context sliding. The KV window holds `position - spill->count` tokens; the ones that slid
+     * out live on SSD in `spill` (owned by the slot, not by Model). The first `slide_keep`
+     * tokens always stay in the window (attention sinks). Recurrent layers need nothing: their
+     * state already summarises everything. */
+    bool slide;
+    int slide_keep;
+    size_t slide_pin;    /* tokens of the pinned system prompt: never slid out (set per conversation) */
+    KVSpill *spill;
 
     /* Full-attention KV caches. */
     KVCache *kv_cache;
@@ -135,7 +146,19 @@ int32_t model_forward(Model *model, int32_t input_token);
 /* Process a prompt token without computing logits or sampling.
  * Returns MODEL_FORWARD_OK or MODEL_FORWARD_ERROR. */
 int model_prefill(Model *model, int32_t input_token);
+/* Advance the context by n prompt tokens without computing logits, in chunks of up to
+ * model_prefill_max_chunk() tokens (batched matmuls, GPU when available, MoE experts grouped).
+ * Uses one scratch area shared by all slots: call it only while holding the slot manager's step lock.
+ * On failure the context is inconsistent (roll back or reset it). */
+int model_prefill_batch(Model *model, const int32_t *tokens, size_t n);
+int model_prefill_max_chunk(void);
+/* Free the shared prefill scratch and the GPU staging buffers it grew. Hold the step lock. */
+void model_prefill_release(void);
 void model_reset(Model *model);
+/* Change the attention window. Growing brings spilled tokens back from SSD, shrinking pushes the
+ * oldest ones out to SSD. Set model->slide / slide_keep first. 0 = ok, -1 = failed (unchanged
+ * apart from tokens already moved to SSD, which stay recoverable). */
+int model_set_context(Model *model, size_t new_ctx);
 void model_free(Model *model);
 bool model_is_attention_layer(int layer);
 bool model_is_recurrent_layer(int layer);

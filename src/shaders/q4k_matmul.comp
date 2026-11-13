@@ -1,0 +1,144 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+// Q4_K matrix x matrix product for prefill:  Y[t][r] = dot(W[r], X[t])  for t < T.
+// Same bindings as q4k_matvec.comp, push constants gain a 4th word (T). Compiled twice:
+// -DTT=8 and -DTT=16 (tokens per workgroup); the host picks one from the token count.
+//
+// 64 threads / workgroup = 8 row slots x 8 threads. Each thread owns RPT rows and decodes its
+// 16-byte qs chunk of every block ONCE, then multiplies it with all TT tokens of the tile.
+// X is staged per block (TT x 256 floats) in shared memory.
+// Weights are dequantized as (d*sc*q - dmin*m) up front, so no per-token sum(x) is needed.
+// Host constants that must match: ROWS_PER_WG = 8*RPT (=16), tile = TT, groups.y = ceil(T/TT).
+// Requires cols % 256 == 0.
+
+#ifndef TT
+#define TT 16
+#endif
+#define RPT 2
+#define ROW_SLOTS 8
+#define ROWS_PER_WG (ROW_SLOTS * RPT)
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer WeightBuffer { uvec4 data[]; } weights;
+layout(std430, set = 0, binding = 1) readonly buffer VectorBuffer { vec4 data[]; } inputX;
+layout(std430, set = 0, binding = 2) writeonly buffer OutputBuffer { float data[]; } outputY;
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    uint blocksPerRow;
+    uint T;
+} p;
+
+shared vec4 xs[TT * 64];
+shared float partial[RPT * TT * 64];
+
+uint sbyte(uvec3 s, uint i)
+{
+    return (s[i >> 2] >> ((i & 3u) * 8u)) & 255u;
+}
+
+void scaleMin(uvec3 s, uint j, out float sc, out float mn)
+{
+    uint a;
+    uint b;
+    if (j < 4u) {
+        a = sbyte(s, j) & 63u;
+        b = sbyte(s, j + 4u) & 63u;
+    } else {
+        uint v = sbyte(s, j + 4u);
+        a = (v & 15u) | ((sbyte(s, j - 4u) >> 6) << 4);
+        b = (v >> 4) | ((sbyte(s, j) >> 6) << 4);
+    }
+    sc = float(a);
+    mn = float(b);
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint slot = tid >> 3;
+    uint sub = tid & 7u;
+    uint g = sub >> 1;
+    uint h = sub & 1u;
+    uint t0 = gl_WorkGroupID.y * uint(TT);
+    uint nb = p.blocksPerRow;
+    uint colVec = p.cols >> 2;
+    uint xi = g * 16u + h * 4u;
+
+    uint rowIdx[RPT];
+    [[unroll]] for (uint r = 0u; r < RPT; ++r)
+        rowIdx[r] = min(gl_WorkGroupID.x * ROWS_PER_WG + slot + r * ROW_SLOTS, p.rows - 1u);
+
+    float acc[RPT][TT];
+    [[unroll]] for (uint r = 0u; r < RPT; ++r)
+        [[unroll]] for (uint t = 0u; t < TT; ++t)
+            acc[r][t] = 0.0;
+
+    for (uint b = 0u; b < nb; ++b) {
+        barrier();
+        for (uint i = tid; i < uint(TT) * 64u; i += 64u) {
+            uint t = i >> 6;
+            uint tok = t0 + t;
+            xs[i] = tok < p.T ? inputX.data[tok * colVec + b * 64u + (i & 63u)] : vec4(0.0);
+        }
+        barrier();
+
+        uvec4 q[RPT];
+        float dl[RPT], ml[RPT], dh[RPT], mh[RPT];
+        [[unroll]] for (uint r = 0u; r < RPT; ++r) {
+            uint unit = rowIdx[r] * nb * 9u + b * 9u;
+            uvec4 hdr = weights.data[unit];
+            q[r] = weights.data[unit + 1u + sub];
+            vec2 dd = unpackHalf2x16(hdr.x);
+            uvec3 s = hdr.yzw;
+            float scLo, mnLo, scHi, mnHi;
+            scaleMin(s, 2u * g, scLo, mnLo);
+            scaleMin(s, 2u * g + 1u, scHi, mnHi);
+            dl[r] = dd.x * scLo;  ml[r] = dd.y * mnLo;
+            dh[r] = dd.x * scHi;  mh[r] = dd.y * mnHi;
+        }
+
+        [[unroll]] for (uint w = 0u; w < 4u; ++w) {
+            vec4 wl[RPT], wh[RPT];
+            [[unroll]] for (uint r = 0u; r < RPT; ++r) {
+                uint v = q[r][w];
+                vec4 lo = vec4(float(v & 15u), float((v >> 8) & 15u),
+                               float((v >> 16) & 15u), float((v >> 24) & 15u));
+                vec4 hi = vec4(float((v >> 4) & 15u), float((v >> 12) & 15u),
+                               float((v >> 20) & 15u), float((v >> 28) & 15u));
+                wl[r] = lo * dl[r] - vec4(ml[r]);
+                wh[r] = hi * dh[r] - vec4(mh[r]);
+            }
+            [[unroll]] for (uint t = 0u; t < TT; ++t) {
+                vec4 xl = xs[t * 64u + xi + w];
+                vec4 xh = xs[t * 64u + xi + 8u + w];
+                [[unroll]] for (uint r = 0u; r < RPT; ++r)
+                    acc[r][t] += dot(wl[r], xl) + dot(wh[r], xh);
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < RPT; ++r)
+        [[unroll]] for (uint t = 0u; t < TT; ++t)
+            partial[(r * uint(TT) + t) * 64u + tid] = acc[r][t];
+    barrier();
+    if (sub == 0u) {
+        [[unroll]] for (uint r = 0u; r < RPT; ++r) {
+            uint row = gl_WorkGroupID.x * ROWS_PER_WG + slot + r * ROW_SLOTS;
+            if (row >= p.rows)
+                continue;
+            for (uint t = 0u; t < uint(TT); ++t) {
+                uint tok = t0 + t;
+                if (tok >= p.T)
+                    break;
+                float s = 0.0;
+                uint base = (r * uint(TT) + t) * 64u + tid;
+                for (uint i = 0u; i < 8u; ++i)
+                    s += partial[base + i];
+                outputY.data[tok * p.rows + row] = s;
+            }
+        }
+    }
+}

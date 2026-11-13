@@ -602,6 +602,7 @@ static void claim_slot(
     const ExpertLocation *loc
 )
 {
+    w->stat_loads++;
     slot->expert_id = expert;
     slot->gate_type = loc->gate_type;
     slot->up_type = loc->up_type;
@@ -964,6 +965,7 @@ CachedExpert *weights_get_expert(
         return NULL;
     if (!w->cache)
         return NULL;
+    w->stat_requests++;
     LayerCache *cache =
         &w->cache[layer];
     /* Cache hit */

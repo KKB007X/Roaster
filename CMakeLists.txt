@@ -45,9 +45,13 @@ add_executable(roaster
     src/weights.c
     src/model.c
     src/kernels.c
+    src/state.c
     src/slots.c
     src/server.c
     src/client.c
+    src/api.c
+    src/kvspill.c
+    src/kvwindow.c
 )
 add_dependencies(roaster roaster_shaders)
 

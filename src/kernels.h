@@ -48,6 +48,37 @@ void kernel_matvec_quant_batch(const KernelMatvecJob *jobs, int n);
 int  kernel_matvec_quant_begin(const KernelMatvecJob *jobs, int n);
 void kernel_matvec_quant_end(void);
 
+/*
+ * Multi-token (prefill) matmul:  Y[t*rows + r] = dot(W[r], X[t*cols ...])  for t < T.
+ * Jobs are independent; jobs that share the same X pointer upload it once. On the GPU all jobs of a
+ * call run in ONE submit; if Vulkan is unavailable or a step fails the CPU kernel is used, so the
+ * call only fails (-1) for invalid arguments (cols must be a multiple of 256).
+ */
+typedef struct {
+    int is_q6;             /* 0 = Q4_K, 1 = Q6_K */
+    const void *matrix;    /* rows x cols quantized */
+    const float *X;        /* T x cols */
+    float *Y;              /* T x rows */
+    size_t rows, cols, T;
+} KernelMatmulJob;
+int kernel_matmul_quant_batch(const KernelMatmulJob *jobs, int n);
+
+/*
+ * Prefill MoE FFN for a batch of experts, each applied to its own group of tokens:
+ *   D_e = down( silu(gate X_e) * (up X_e) )
+ * X holds the gathered input rows of all experts back to back (expert 0's n rows, then expert 1's...),
+ * D receives the output rows in the same order. gate/up: inter x hidden, down: hidden x inter.
+ * Runs as ONE GPU submit when possible (inter*4 and hidden*4 must be multiples of 256), otherwise on
+ * the CPU. Returns 0 on success, -1 on invalid arguments.
+ */
+typedef struct {
+    const void *gate, *up, *down;
+    int gate_q6, up_q6, down_q6;
+    size_t n;              /* tokens routed to this expert */
+} KernelMoeExpert;
+int kernel_moe_prefill(const KernelMoeExpert *experts, int count, const float *X, float *D,
+                       size_t inter, size_t hidden);
+
 /* One MoE expert FFN: out = down( silu(gate x) * (up x) ), gate/up: inter x hidden, down: hidden x inter. */
 typedef struct {
     const void *gate, *up, *down;
@@ -59,6 +90,9 @@ typedef struct {
  * Returns 1 on success; 0 = unavailable and the caller must use the generic path.
  * inter and hidden must be multiples of 256 and n <= 9. */
 int kernel_ffn_fused(const KernelFfnExpert *experts, int n, const float *x, size_t inter, size_t hidden);
+
+/* Free the (possibly large) staging buffers grown by prefill; they are recreated small on demand. */
+void   kernel_vk_trim_scratch(void);
 
 /* Vulkan backend lifecycle; CPU kernels remain available as fallback. */
 void   kernel_vk_shutdown(void);

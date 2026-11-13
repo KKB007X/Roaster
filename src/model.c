@@ -15,8 +15,10 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "kernels.h"
+#include "kvwindow.h"
 
 /* ============================================================
  * Internal helpers
@@ -49,7 +51,7 @@ static size_t locked_buffer_page_size(void)
     return value > 0 ? (size_t)value : 4096u;
 }
 
-static void *locked_calloc_checked(size_t count, size_t size)
+void *locked_calloc_checked(size_t count, size_t size)
 {
     size_t bytes;
     if (!checked_mul_size(count, size, &bytes) || bytes == 0)
@@ -81,7 +83,7 @@ static void *locked_calloc_checked(size_t count, size_t size)
     return data;
 }
 
-static void locked_buffer_free(void *data)
+void locked_buffer_free(void *data)
 {
     if (!data)
         return;
@@ -619,6 +621,9 @@ int model_init(
     model->route_alpha = 1.0f;
     model->route_p = 0.0f;
     model->position = 0;
+    model->slide = false;
+    model->slide_keep = KVW_DEFAULT_KEEP;
+    model->spill = NULL;
     model->rng_state = (((uint64_t)time(NULL)) << 32) ^
                        (uint64_t)(uintptr_t)model ^
                        UINT64_C(0x9e3779b97f4a7c15);
@@ -713,6 +718,9 @@ void model_reset(Model *model)
     if (!model || !model->initialized)
         return;
     model->position = 0;
+    model->slide_pin = 0;
+    if (model->spill)
+        kvspill_clear(model->spill);        /* a fresh context has nothing on SSD */
     /* KV contents are never read past kv->length, so only the length is
      * reset (zeroing the whole cache was O(context) per request). */
     if (model->kv_cache) {
@@ -776,7 +784,7 @@ static int full_attention(Model *m, int layer)
 {
     const LayerRefs *R = &((const ModelRefs *)m->refs)->layer[layer];
     KVCache *kv = &m->kv_cache[layer];
-    if (m->position >= kv->capacity || !m->attn_scratch)
+    if (kv->length >= kv->capacity || !m->attn_scratch)
         return -1;
     /*
      * Q projection. Physical layout: [Q0 | G0 | Q1 | G1 | ... | Q15 | G15],
@@ -804,9 +812,11 @@ static int full_attention(Model *m, int layer)
     /* Partial RoPE: only the first 64 dims are rotated. */
     apply_rope_64(m->attn_q, 16, 256, m->position);
     apply_rope_64(m->attn_k, 2, 256, m->position);
-    memcpy(kv->k + m->position * 512, m->attn_k, 512 * sizeof(float));
-    memcpy(kv->v + m->position * 512, m->attn_v, 512 * sizeof(float));
-    kv->length = m->position + 1;
+    /* The cache slot is the window length, not the absolute position (the window may have slid). */
+    const size_t cache_slot = kv->length;
+    memcpy(kv->k + cache_slot * 512, m->attn_k, 512 * sizeof(float));
+    memcpy(kv->v + cache_slot * 512, m->attn_v, 512 * sizeof(float));
+    kv->length = cache_slot + 1;
     /*
      * Causal GQA: 16 Q heads, 2 KV heads (8 Q heads per KV head).
      * Heads are independent; each gets its own score row in persistent
@@ -1251,7 +1261,8 @@ static int32_t forward_impl(Model *model, int32_t input_token, int want_logits)
         return MODEL_FORWARD_ERROR;
     if (input_token < 0 || input_token >= MODEL_VOCAB_SIZE)
         return MODEL_FORWARD_ERROR;
-    if (model->position >= model->context_length)
+    /* Slide the attention window if it is full (or fail when sliding is off). */
+    if (kvw_ensure_room(model, 1) != 0)
         return MODEL_FORWARD_ERROR;
     const ModelRefs *R = (const ModelRefs *)model->refs;
     if (model_embedding(model, input_token, model->hidden) != MODEL_FORWARD_OK)
@@ -1374,6 +1385,518 @@ int model_prefill(Model *model, int32_t input_token)
 {
     int32_t rc = forward_impl(model, input_token, 0);
     return rc == MODEL_FORWARD_OK ? MODEL_FORWARD_OK : MODEL_FORWARD_ERROR;
+}
+
+
+/* ============================================================
+ * Batched prefill
+ *
+ * A chunk of up to PF_MAX_T prompt tokens goes through every layer together: dense projections are
+ * matmuls (weights decoded once per chunk, on the GPU when possible), the Gated DeltaNet recurrence
+ * and the causal attention stay sequential in the token dimension, and the MoE FFN groups the
+ * (token, expert) pairs by expert so each expert is read from SSD once per chunk and applied to all
+ * of its tokens at once. The scratch area is shared by all slots: callers must hold the slot
+ * manager's step lock.
+ * ============================================================ */
+#define PF_MAX_T 256
+#define PF_H     MODEL_HIDDEN_SIZE
+#define PF_MAX_BATCH 32                  /* experts per MoE batch (<= PREFETCH_MAX in weights.c) */
+
+typedef struct {
+    size_t ctx;
+    int nthr;
+    float *hid, *nrm, *res, *ffn, *qkv, *gate, *q, *k, *v, *rec, *qb, *kb, *vb, *al, *be, *rl,
+          *cv, *sg, *su, *sd, *sgi, *xg, *ed, *wts, *scores;
+    int *ids, *lt, *lk;
+    int ready;
+} PF;
+static PF g_pf;
+
+static float *pf_alloc(size_t floats)
+{
+    return malloc(floats * sizeof(float));
+}
+
+static int pf_ensure(size_t ctx)
+{
+    PF *p = &g_pf;
+    const size_t T = PF_MAX_T;
+    if (!p->ready) {
+        p->hid = pf_alloc(T * PF_H);   p->nrm = pf_alloc(T * PF_H);
+        p->res = pf_alloc(T * PF_H);   p->ffn = pf_alloc(T * PF_H);
+        p->qkv = pf_alloc(T * 8192);   p->gate = pf_alloc(T * 4096);
+        p->q = pf_alloc(T * 4096);     p->k = pf_alloc(T * 512);   p->v = pf_alloc(T * 512);
+        p->rec = pf_alloc(T * 4096);
+        p->qb = pf_alloc(T * 2048);    p->kb = pf_alloc(T * 2048); p->vb = pf_alloc(T * 4096);
+        p->al = pf_alloc(T * 32);      p->be = pf_alloc(T * 32);
+        p->rl = pf_alloc(T * MODEL_NUM_EXPERTS);
+        p->cv = pf_alloc(MODEL_LINEAR_QKV_SIZE);
+        p->sg = pf_alloc(T * 512);     p->su = pf_alloc(T * 512);  p->sd = pf_alloc(T * PF_H);
+        p->sgi = pf_alloc(T);
+        p->xg = pf_alloc(T * MODEL_TOP_K * PF_H);          /* gathered expert inputs / outputs */
+        p->ed = pf_alloc(T * MODEL_TOP_K * PF_H);
+        p->wts = pf_alloc(T * MODEL_TOP_K);
+        p->ids = malloc(T * MODEL_TOP_K * sizeof(int));
+        p->lt = malloc(T * MODEL_TOP_K * sizeof(int));
+        p->lk = malloc(T * MODEL_TOP_K * sizeof(int));
+        if (!p->hid || !p->nrm || !p->res || !p->ffn || !p->qkv || !p->gate || !p->q || !p->k || !p->v ||
+            !p->rec || !p->qb || !p->kb || !p->vb || !p->al || !p->be || !p->rl || !p->cv || !p->sg ||
+            !p->su || !p->sd || !p->sgi || !p->xg || !p->ed || !p->wts || !p->ids || !p->lt || !p->lk)
+            return -1;
+        p->ready = 1;
+    }
+#ifdef _OPENMP
+    int nthr = omp_get_max_threads();
+#else
+    int nthr = 1;
+#endif
+    if (p->ctx < ctx || p->nthr < nthr) {
+        free(p->scores);
+        p->scores = malloc((size_t)nthr * ctx * sizeof(float));
+        if (!p->scores) { p->ctx = 0; p->nthr = 0; return -1; }
+        p->ctx = ctx;
+        p->nthr = nthr;
+    }
+    return 0;
+}
+
+static int pf_tid(void)
+{
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
+
+/* Y[t*rows + r] for several weight matrices sharing the input X (T x cols). Quantized tensors run as
+ * one batched matmul submit; f32 tensors (router, gates) run on the CPU. */
+static int pf_mm(const TRef *const *refs, float *const *outs, const size_t *rows, int n,
+                 const float *X, size_t cols, int T)
+{
+    KernelMatmulJob jobs[8];
+    int nj = 0;
+    for (int i = 0; i < n; i++) {
+        const TRef *r = refs[i];
+        if (!r->t || !r->d || nj >= 8) {
+            fprintf(stderr, "ERROR: required tensor missing from model\n");
+            return -1;
+        }
+        if (r->t->type == 12 || r->t->type == 14) {
+            jobs[nj++] = (KernelMatmulJob){ r->t->type == 14, r->d, X, outs[i], rows[i], cols, (size_t)T };
+        } else if (r->t->type == 0) {
+            const float *w = (const float *)r->d;
+            #pragma omp parallel for schedule(static) if (T > 1)
+            for (int t = 0; t < T; t++)
+                kernel_matvec_f32(w, X + (size_t)t * cols, outs[i] + (size_t)t * rows[i], rows[i], cols);
+        } else {
+            fprintf(stderr, "ERROR: unsupported tensor type %u\n", r->t->type);
+            return -1;
+        }
+    }
+    return nj ? kernel_matmul_quant_batch(jobs, nj) : 0;
+}
+
+static int pf_mm1(const TRef *r, float *out, size_t rows, const float *X, size_t cols, int T)
+{
+    const TRef *refs[1] = { r };
+    float *outs[1] = { out };
+    return pf_mm(refs, outs, &rows, 1, X, cols, T);
+}
+
+/* One value head of the Gated DeltaNet step (same math as recurrent_delta_step). */
+static void delta_head(float *st, const float *qh, const float *khv, const float *vhv,
+                       float decay, float b, float *out)
+{
+    const float scale = 1.0f / sqrtf((float)MODEL_LINEAR_HEAD_DIM);
+    const float d = expf(decay);
+    float A[MODEL_LINEAR_HEAD_DIM] = {0}, B[MODEL_LINEAR_HEAD_DIM] = {0}, delta[MODEL_LINEAR_HEAD_DIM];
+    float kq = 0.0f;
+    for (int r = 0; r < MODEL_LINEAR_HEAD_DIM; r++) {
+        const float kr = khv[r], qr = qh[r];
+        const float *row = st + r * MODEL_LINEAR_HEAD_DIM;
+        kq += kr * qr;
+        for (int c = 0; c < MODEL_LINEAR_HEAD_DIM; c++) {
+            A[c] += row[c] * kr;
+            B[c] += row[c] * qr;
+        }
+    }
+    for (int c = 0; c < MODEL_LINEAR_HEAD_DIM; c++) {
+        delta[c] = (vhv[c] - d * A[c]) * b;
+        out[c] = (d * B[c] + kq * delta[c]) * scale;
+    }
+    for (int r = 0; r < MODEL_LINEAR_HEAD_DIM; r++) {
+        const float kr = khv[r];
+        float *row = st + r * MODEL_LINEAR_HEAD_DIM;
+        for (int c = 0; c < MODEL_LINEAR_HEAD_DIM; c++)
+            row[c] = d * row[c] + kr * delta[c];
+    }
+}
+
+static int pf_attention(Model *m, int layer, int T, size_t base)
+{
+    const LayerRefs *R = &((const ModelRefs *)m->refs)->layer[layer];
+    KVCache *kv = &m->kv_cache[layer];
+    PF *p = &g_pf;
+    /* `base` = absolute position (RoPE); `kbase` = first free slot of the (possibly slid) window. */
+    const size_t kbase = kv->length;
+    if (kbase + (size_t)T > kv->capacity || !R->qnorm || !R->knorm)
+        return -1;
+    {
+        const TRef *refs[3] = { &R->q, &R->k, &R->v };
+        float *outs[3] = { p->qkv, p->k, p->v };
+        const size_t rws[3] = { MODEL_ATTN_Q_SIZE, MODEL_ATTN_K_SIZE, MODEL_ATTN_V_SIZE };
+        if (pf_mm(refs, outs, rws, 3, p->nrm, PF_H, T) != 0)
+            return -1;
+    }
+    /* Split Q|G per head, QK-norm, RoPE, and append K/V to the cache. Tokens are independent. */
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < T; t++) {
+        float *qg = p->qkv + (size_t)t * MODEL_ATTN_Q_SIZE, *q = p->q + (size_t)t * 4096;
+        float *g = p->gate + (size_t)t * 4096, *kt = p->k + (size_t)t * 512;
+        for (int h = 0; h < MODEL_QK_HEAD_COUNT; h++) {
+            memcpy(q + h * 256, qg + h * 512, 256 * sizeof(float));
+            memcpy(g + h * 256, qg + h * 512 + 256, 256 * sizeof(float));
+            kernel_rmsnorm(q + h * 256, q + h * 256, R->qnorm, 256, 1e-6f);
+        }
+        for (int h = 0; h < 2; h++)
+            kernel_rmsnorm(kt + h * 256, kt + h * 256, R->knorm, 256, 1e-6f);
+        apply_rope_64(q, 16, 256, base + (size_t)t);
+        apply_rope_64(kt, 2, 256, base + (size_t)t);
+        memcpy(kv->k + (kbase + (size_t)t) * 512, kt, 512 * sizeof(float));
+        memcpy(kv->v + (kbase + (size_t)t) * 512, p->v + (size_t)t * 512, 512 * sizeof(float));
+    }
+    kv->length = kbase + (size_t)T;
+    /* Causal GQA, one (token, head) per iteration. p->rec doubles as the attention output. */
+    const float inv_sqrt = 1.0f / 16.0f;
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int idx = 0; idx < T * 16; idx++) {
+        const int t = idx / 16, qh = idx % 16, kvh = qh / 8;
+        const size_t len = kbase + (size_t)t + 1;
+        const float *q = p->q + (size_t)t * 4096 + qh * 256;
+        float *scores = p->scores + (size_t)pf_tid() * p->ctx;
+        float mx = -INFINITY;
+        for (size_t s = 0; s < len; s++) {
+            float v = kernel_dot_f32(q, kv->k + s * 512 + kvh * 256, 256) * inv_sqrt;
+            scores[s] = v;
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0f;
+        for (size_t s = 0; s < len; s++) {
+            scores[s] = expf(scores[s] - mx);
+            sum += scores[s];
+        }
+        const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        float *out = p->rec + (size_t)t * 4096 + qh * 256;
+        memset(out, 0, 256 * sizeof(float));
+        for (size_t s = 0; s < len; s++) {
+            const float *v = kv->v + s * 512 + kvh * 256, pr = scores[s] * inv;
+            for (int d = 0; d < 256; d++)
+                out[d] += pr * v[d];
+        }
+        const float *g = p->gate + (size_t)t * 4096 + qh * 256;
+        for (int d = 0; d < 256; d++)
+            out[d] *= 1.0f / (1.0f + expf(-g[d]));
+    }
+    return pf_mm1(&R->o, p->res, MODEL_HIDDEN_SIZE, p->rec, 4096, T);
+}
+
+static int pf_ssm(Model *m, int layer, int T)
+{
+    const LayerRefs *L = &((const ModelRefs *)m->refs)->layer[layer];
+    SSMState *ss = &m->ssm_state[layer];
+    PF *p = &g_pf;
+    if (!L->conv || !L->dt || !L->a || !L->ssm_norm)
+        return -1;
+    {
+        const TRef *refs[4] = { &L->qkv, &L->gate, &L->alpha, &L->beta };
+        float *outs[4] = { p->qkv, p->gate, p->al, p->be };
+        const size_t rws[4] = { MODEL_LINEAR_QKV_SIZE, MODEL_LINEAR_GATE_SIZE,
+                                MODEL_LINEAR_V_HEADS, MODEL_LINEAR_V_HEADS };
+        if (pf_mm(refs, outs, rws, 4, p->nrm, PF_H, T) != 0)
+            return -1;
+    }
+    float *hist = ss->conv_state;
+    const size_t Q = MODEL_LINEAR_QKV_SIZE;
+    /* Causal conv (carries history token to token) and the per-token q/k/v + gate preparation. */
+    for (int t = 0; t < T; t++) {
+        const float *in = p->qkv + (size_t)t * Q;
+        kernel_conv1d_causal_f32(in, hist, L->conv, p->cv, Q, MODEL_SSM_CONV_KERNEL);
+        kernel_silu_array(p->cv, Q);
+        memmove(hist, hist + Q, (MODEL_SSM_CONV_KERNEL - 2) * Q * sizeof(float));
+        memcpy(hist + (MODEL_SSM_CONV_KERNEL - 2) * Q, in, Q * sizeof(float));
+        float *qb = p->qb + (size_t)t * 2048, *kb = p->kb + (size_t)t * 2048, *vb = p->vb + (size_t)t * 4096;
+        memcpy(qb, p->cv, MODEL_LINEAR_Q_SIZE * sizeof(float));
+        memcpy(kb, p->cv + MODEL_LINEAR_Q_SIZE, MODEL_LINEAR_K_SIZE * sizeof(float));
+        memcpy(vb, p->cv + MODEL_LINEAR_Q_SIZE + MODEL_LINEAR_K_SIZE, MODEL_LINEAR_V_SIZE * sizeof(float));
+        for (int h = 0; h < MODEL_LINEAR_K_HEADS; h++) {
+            kernel_l2norm(qb + h * 128, qb + h * 128, 128, 1e-6f);
+            kernel_l2norm(kb + h * 128, kb + h * 128, 128, 1e-6f);
+        }
+        float *al = p->al + (size_t)t * 32, *be = p->be + (size_t)t * 32;
+        for (int h = 0; h < MODEL_LINEAR_V_HEADS; h++) {
+            be[h] = 1.0f / (1.0f + expf(-be[h]));
+            float x = al[h] + L->dt[h];
+            al[h] = L->a[h] * (x > 20.0f ? x : log1pf(expf(x)));
+        }
+    }
+    /* Value heads are independent: ONE parallel region per layer, each head walks all T tokens. */
+    #pragma omp parallel for schedule(static)
+    for (int vh = 0; vh < MODEL_LINEAR_V_HEADS; vh++) {
+        const int kh = vh % MODEL_LINEAR_K_HEADS;
+        float *st = ss->state + (size_t)vh * 128 * 128;
+        for (int t = 0; t < T; t++) {
+            float *out = p->rec + (size_t)t * 4096 + vh * 128;
+            delta_head(st, p->qb + (size_t)t * 2048 + kh * 128, p->kb + (size_t)t * 2048 + kh * 128,
+                       p->vb + (size_t)t * 4096 + vh * 128, p->al[(size_t)t * 32 + vh],
+                       p->be[(size_t)t * 32 + vh], out);
+            kernel_rmsnorm(out, out, L->ssm_norm, 128, 1e-6f);
+            const float *z = p->gate + (size_t)t * 4096 + vh * 128;
+            for (int j = 0; j < 128; j++)
+                out[j] *= z[j] * (1.0f / (1.0f + expf(-z[j])));
+        }
+    }
+    return pf_mm1(&L->ssm_out, p->res, MODEL_HIDDEN_SIZE, p->rec, MODEL_LINEAR_V_SIZE, T);
+}
+
+typedef struct { Weights *w; int layer; const int *ids; int count; } PrefetchJob;
+
+static void *prefetch_main(void *arg)
+{
+    PrefetchJob *j = arg;
+    (void)weights_prefetch_experts(j->w, j->layer, j->ids, j->count);
+    return NULL;
+}
+
+static int pf_moe(Model *m, int layer, int T)
+{
+    const LayerRefs *R = &((const ModelRefs *)m->refs)->layer[layer];
+    Weights *w = m->weights;
+    PF *p = &g_pf;
+    const size_t H = PF_H;
+
+    /* Routing for every token. */
+    if (pf_mm1(&R->router, p->rl, MODEL_NUM_EXPERTS, p->nrm, H, T) != 0)
+        return -1;
+    for (int t = 0; t < T; t++) {
+        memcpy(m->router_logits, p->rl + (size_t)t * MODEL_NUM_EXPERTS, MODEL_NUM_EXPERTS * sizeof(float));
+        if (m->cache_route)
+            select_cache_route(m, layer);
+        else
+            select_top8(m->router_logits, m->expert_ids, m->expert_weights);
+        for (int k = 0; k < MODEL_TOP_K; k++)
+            if (m->expert_ids[k] < 0 || m->expert_ids[k] >= MODEL_NUM_EXPERTS)
+                return -1;
+        memcpy(p->ids + t * MODEL_TOP_K, m->expert_ids, MODEL_TOP_K * sizeof(int));
+        memcpy(p->wts + t * MODEL_TOP_K, m->expert_weights, MODEL_TOP_K * sizeof(float));
+    }
+
+    /* Shared expert for all tokens: ffn = sigmoid(gate_inp . x) * down(silu(gate x) * up x). */
+    {
+        const TRef *refs[2] = { &R->sh_gate, &R->sh_up };
+        float *outs[2] = { p->sg, p->su };
+        const size_t rws[2] = { 512, 512 };
+        if (pf_mm(refs, outs, rws, 2, p->nrm, H, T) != 0)
+            return -1;
+    }
+    for (size_t i = 0; i < (size_t)T * 512; i++)
+        p->sg[i] = (p->sg[i] / (1.0f + expf(-p->sg[i]))) * p->su[i];
+    if (pf_mm1(&R->sh_down, p->sd, H, p->sg, 512, T) != 0 ||
+        pf_mm1(&R->sh_gate_inp, p->sgi, 1, p->nrm, H, T) != 0)
+        return -1;
+    for (int t = 0; t < T; t++) {
+        const float g = 1.0f / (1.0f + expf(-p->sgi[t]));
+        for (size_t i = 0; i < H; i++)
+            p->ffn[(size_t)t * H + i] = g * p->sd[(size_t)t * H + i];
+    }
+
+    /* Group the (token, k) pairs by expert. */
+    int cnt[MODEL_NUM_EXPERTS] = {0}, off[MODEL_NUM_EXPERTS + 1], fill[MODEL_NUM_EXPERTS];
+    for (int i = 0; i < T * MODEL_TOP_K; i++)
+        cnt[p->ids[i]]++;
+    off[0] = 0;
+    for (int e = 0; e < MODEL_NUM_EXPERTS; e++) {
+        off[e + 1] = off[e] + cnt[e];
+        fill[e] = off[e];
+    }
+    for (int t = 0; t < T; t++)
+        for (int k = 0; k < MODEL_TOP_K; k++) {
+            int e = p->ids[t * MODEL_TOP_K + k], pos = fill[e]++;
+            p->lt[pos] = t;
+            p->lk[pos] = k;
+        }
+    int order[MODEL_NUM_EXPERTS], nu = 0;
+    for (int e = 0; e < MODEL_NUM_EXPERTS; e++)
+        if (cnt[e])
+            order[nu++] = e;
+
+    /* Experts in batches. With room for two batches in the cache, the next batch is read from SSD
+     * by a helper thread while the current one computes (the helper only touches the cache, the
+     * compute only touches resident slots of the current batch). */
+    const int cap = w->cache[layer].capacity;
+    int B = cap / 2;
+    if (B < 1) B = 1;
+    if (B > PF_MAX_BATCH) B = PF_MAX_BATCH;
+    const int overlap = cap >= 2 * B;
+    const int nbatch = (nu + B - 1) / B;
+    for (int bi = 0; bi < nbatch; bi++) {
+        const int i0 = bi * B, nb = nu - i0 < B ? nu - i0 : B;
+        if (bi == 0 || !overlap)
+            (void)weights_prefetch_experts(w, layer, order + i0, nb);
+        CachedExpert *ce[PF_MAX_BATCH];
+        for (int j = 0; j < nb; j++) {
+            ce[j] = weights_get_expert(w, layer, order[i0 + j]);
+            if (!ce[j] || !ce[j]->gate || !ce[j]->up || !ce[j]->down ||
+                (ce[j]->gate_type != 12 && ce[j]->gate_type != 14) ||
+                (ce[j]->up_type != 12 && ce[j]->up_type != 14) ||
+                (ce[j]->down_type != 12 && ce[j]->down_type != 14))
+                return -1;
+        }
+        pthread_t th;
+        PrefetchJob job = { w, layer, order + i0 + B, nu - i0 - B < B ? nu - i0 - B : B };
+        int helper = 0;
+        if (overlap && bi + 1 < nbatch)
+            helper = pthread_create(&th, NULL, prefetch_main, &job) == 0;
+
+        KernelMoeExpert kx[PF_MAX_BATCH];
+        size_t row = 0;
+        for (int j = 0; j < nb; j++) {
+            const int e = order[i0 + j], n = cnt[e];
+            for (int a = 0; a < n; a++)
+                memcpy(p->xg + (row + (size_t)a) * H, p->nrm + (size_t)p->lt[off[e] + a] * H, H * sizeof(float));
+            kx[j] = (KernelMoeExpert){ ce[j]->gate, ce[j]->up, ce[j]->down, ce[j]->gate_type == 14,
+                                       ce[j]->up_type == 14, ce[j]->down_type == 14, (size_t)n };
+            row += (size_t)n;
+        }
+        int rc = kernel_moe_prefill(kx, nb, p->xg, p->ed, 512, H);
+        if (helper)
+            pthread_join(th, NULL);
+        if (rc != 0)
+            return -1;
+        row = 0;
+        for (int j = 0; j < nb; j++) {
+            const int e = order[i0 + j], n = cnt[e];
+            for (int a = 0; a < n; a++) {
+                const int t = p->lt[off[e] + a], k = p->lk[off[e] + a];
+                const float wt = p->wts[t * MODEL_TOP_K + k];
+                float *dst = p->ffn + (size_t)t * H;
+                const float *src = p->ed + (row + (size_t)a) * H;
+                for (size_t x = 0; x < H; x++)
+                    dst[x] += wt * src[x];
+            }
+            row += (size_t)n;
+        }
+    }
+    return 0;
+}
+
+static int prefill_chunk(Model *m, const int32_t *tok, int T)
+{
+    const ModelRefs *R = (const ModelRefs *)m->refs;
+    PF *p = &g_pf;
+    const size_t base = m->position;
+    if (kvw_ensure_room(m, (size_t)T) != 0)      /* slides the window if needed */
+        return MODEL_FORWARD_ERROR;
+    for (int t = 0; t < T; t++)
+        if (tok[t] < 0 || tok[t] >= MODEL_VOCAB_SIZE ||
+            model_embedding(m, tok[t], p->hid + (size_t)t * PF_H) != MODEL_FORWARD_OK)
+            return MODEL_FORWARD_ERROR;
+    for (int layer = 0; layer < MODEL_NUM_LAYERS; layer++) {
+        const LayerRefs *L = &R->layer[layer];
+        if (!L->attn_norm || !L->post_norm)
+            return MODEL_FORWARD_ERROR;
+        for (int t = 0; t < T; t++)
+            kernel_rmsnorm(p->nrm + (size_t)t * PF_H, p->hid + (size_t)t * PF_H, L->attn_norm, PF_H, 1e-6f);
+        int rc = model_is_attention_layer(layer) ? pf_attention(m, layer, T, base) : pf_ssm(m, layer, T);
+        if (rc != 0)
+            return MODEL_FORWARD_ERROR;
+        for (size_t i = 0; i < (size_t)T * PF_H; i++)
+            p->hid[i] += p->res[i];
+        for (int t = 0; t < T; t++)
+            kernel_rmsnorm(p->nrm + (size_t)t * PF_H, p->hid + (size_t)t * PF_H, L->post_norm, PF_H, 1e-6f);
+        if (pf_moe(m, layer, T) != 0)
+            return MODEL_FORWARD_ERROR;
+        for (size_t i = 0; i < (size_t)T * PF_H; i++)
+            p->hid[i] += p->ffn[i];
+    }
+    m->position += (size_t)T;
+    return MODEL_FORWARD_OK;
+}
+
+void model_prefill_release(void)
+{
+    PF *p = &g_pf;
+    float **fl[] = { &p->hid, &p->nrm, &p->res, &p->ffn, &p->qkv, &p->gate, &p->q, &p->k, &p->v, &p->rec,
+                     &p->qb, &p->kb, &p->vb, &p->al, &p->be, &p->rl, &p->cv, &p->sg, &p->su, &p->sd,
+                     &p->sgi, &p->xg, &p->ed, &p->wts, &p->scores };
+    for (size_t i = 0; i < sizeof(fl) / sizeof(fl[0]); i++) {
+        free(*fl[i]);
+        *fl[i] = NULL;
+    }
+    free(p->ids); free(p->lt); free(p->lk);
+    memset(p, 0, sizeof(*p));
+    kernel_vk_trim_scratch();
+}
+
+int model_prefill_max_chunk(void)
+{
+    return PF_MAX_T;
+}
+
+int model_prefill_batch(Model *m, const int32_t *tokens, size_t n)
+{
+    if (!m || !m->initialized || !m->refs || !tokens)
+        return MODEL_FORWARD_ERROR;
+    if (pf_ensure(m->context_length) != 0)
+        return MODEL_FORWARD_ERROR;
+    while (n > 0) {
+        int T = n < PF_MAX_T ? (int)n : PF_MAX_T;
+        size_t room = kvw_max_chunk(m);          /* window minus the kept head (or free space) */
+        if (room == 0)
+            return MODEL_FORWARD_ERROR;
+        if ((size_t)T > room)
+            T = (int)room;
+        if (prefill_chunk(m, tokens, T) != MODEL_FORWARD_OK)
+            return MODEL_FORWARD_ERROR;
+        tokens += T;
+        n -= (size_t)T;
+    }
+    return MODEL_FORWARD_OK;
+}
+
+/* ============================================================
+ * Dynamic context window
+ * ============================================================ */
+
+int model_set_context(Model *model, size_t new_ctx)
+{
+    if (!model || !model->initialized || new_ctx == 0)
+        return -1;
+    const size_t old_ctx = model->context_length;
+    if (new_ctx == old_ctx)
+        return 0;
+    size_t scratch_n;
+    if (!checked_mul_size(16, new_ctx, &scratch_n))
+        return -1;
+    float *scratch = calloc_checked(scratch_n, sizeof(float));
+    if (!scratch)
+        return -1;
+    /* Shrinking: push what no longer fits out to SSD first (lossless). */
+    if (new_ctx < old_ctx && kvw_shrink_to_fit(model, new_ctx) != 0) {
+        free(scratch);
+        return -1;
+    }
+    if (kvw_realloc(model, new_ctx) != 0) {
+        free(scratch);
+        return -1;
+    }
+    free(model->attn_scratch);
+    model->attn_scratch = scratch;
+    model->context_length = new_ctx;
+    /* Growing: bring spilled context back from SSD into the larger window. */
+    if (new_ctx > old_ctx && kvw_refill(model) != 0)
+        fprintf(stderr, "Warning: could not restore spilled context from SSD (it stays on disk)\n");
+    return 0;
 }
 
 /* ============================================================

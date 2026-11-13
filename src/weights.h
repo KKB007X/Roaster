@@ -81,6 +81,9 @@ typedef struct {
     int max_experts_per_layer;
 
     uint64_t clock;
+
+    /* Diagnostics: expert requests (weights_get_expert calls) and expert loads from disk. */
+    uint64_t stat_requests, stat_loads;
 } Weights;
 
 int weights_load(

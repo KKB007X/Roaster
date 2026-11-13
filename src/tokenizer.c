@@ -444,20 +444,117 @@ Vocabulary lookup
 ============================================================
 */
 
-static int find_token(
-    const Tokenizer *tok,
-    const char *piece
-)
+/* find_token() is defined below, after the lookup tables. */
+static int find_token(const Tokenizer *tok, const char *piece);
+
+
+/*
+============================================================
+Hash lookups (vocabulary and merge ranks)
+
+The original code scanned the whole vocabulary (~250k strings) for every piece and the whole merge
+list (~250k pairs) for every candidate pair of every BPE iteration. These open-addressing tables make
+both O(1). They are built on first use; slots_init() encodes a warm-up string single-threaded, so
+later concurrent encodes only read them.
+============================================================
+*/
+
+#define FNV_BASIS 1469598103934665603ULL
+#define FNV_PRIME 1099511628211ULL
+
+static uint64_t fnv_str(const char *s, uint64_t h)
 {
-    for(uint64_t i=0;i<tok->vocab_size;i++)
-    {
-        if(strcmp(
-            tok->tokens[i].text,
-            piece
-        )==0)
-        {
-            return i;
-        }
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+static uint64_t merge_hash(const char *a, const char *b)
+{
+    uint64_t h = fnv_str(a, FNV_BASIS);
+    h ^= 0x20;
+    h *= FNV_PRIME;
+    return fnv_str(b, h) * 0x9E3779B97F4A7C15ULL >> 16;     /* mix the high bits down */
+}
+
+static const Tokenizer *g_tab_owner;
+static int32_t *g_vtab, *g_mtab;      /* -1 = empty slot, otherwise vocabulary id / merge rank */
+static size_t g_vmask, g_mmask;
+
+static void free_tables(void)
+{
+    free(g_vtab);
+    free(g_mtab);
+    g_vtab = g_mtab = NULL;
+    g_tab_owner = NULL;
+}
+
+static void build_tables(const Tokenizer *tok)
+{
+    free_tables();
+    size_t vn = 2, mn = 2;
+    while (vn < tok->vocab_size * 2 + 2) vn <<= 1;
+    while (mn < tok->merge_count * 2 + 2) mn <<= 1;
+    g_vtab = malloc(vn * sizeof(int32_t));
+    g_mtab = malloc(mn * sizeof(int32_t));
+    if (!g_vtab || !g_mtab) {
+        fprintf(stderr, "Out of memory\n");
+        exit(1);
+    }
+    memset(g_vtab, 0xFF, vn * sizeof(int32_t));
+    memset(g_mtab, 0xFF, mn * sizeof(int32_t));
+    g_vmask = vn - 1;
+    g_mmask = mn - 1;
+    for (uint64_t i = 0; i < tok->vocab_size; i++) {
+        const char *s = tok->tokens[i].text;
+        if (!s)
+            continue;
+        size_t h = (size_t)fnv_str(s, FNV_BASIS) & g_vmask;
+        while (g_vtab[h] >= 0 && strcmp(tok->tokens[g_vtab[h]].text, s) != 0)
+            h = (h + 1) & g_vmask;
+        if (g_vtab[h] < 0)
+            g_vtab[h] = (int32_t)i;                 /* first occurrence wins, like the linear scan */
+    }
+    for (uint64_t i = 0; i < tok->merge_count; i++) {
+        const Merge *mg = &tok->merges[i];
+        if (!mg->left || !mg->right)
+            continue;
+        size_t h = (size_t)merge_hash(mg->left, mg->right) & g_mmask;
+        while (g_mtab[h] >= 0 &&
+               !(strcmp(tok->merges[g_mtab[h]].left, mg->left) == 0 &&
+                 strcmp(tok->merges[g_mtab[h]].right, mg->right) == 0))
+            h = (h + 1) & g_mmask;
+        if (g_mtab[h] < 0)
+            g_mtab[h] = (int32_t)i;                 /* lowest rank wins, like the linear scan */
+    }
+    g_tab_owner = tok;
+}
+
+static int find_token(const Tokenizer *tok, const char *piece)
+{
+    if (g_tab_owner != tok)
+        build_tables(tok);
+    size_t h = (size_t)fnv_str(piece, FNV_BASIS) & g_vmask;
+    while (g_vtab[h] >= 0) {
+        if (strcmp(tok->tokens[g_vtab[h]].text, piece) == 0)
+            return g_vtab[h];
+        h = (h + 1) & g_vmask;
+    }
+    return -1;
+}
+
+static int merge_rank(const Tokenizer *tok, const char *a, const char *b)
+{
+    if (g_tab_owner != tok)
+        build_tables(tok);
+    size_t h = (size_t)merge_hash(a, b) & g_mmask;
+    while (g_mtab[h] >= 0) {
+        const Merge *mg = &tok->merges[g_mtab[h]];
+        if (strcmp(mg->left, a) == 0 && strcmp(mg->right, b) == 0)
+            return g_mtab[h];
+        h = (h + 1) & g_mmask;
     }
     return -1;
 }
@@ -511,28 +608,8 @@ BPE merge search
 ============================================================
 */
 
-static int merge_rank(
-    const Tokenizer *tok,
-    const char *a,
-    const char *b
-)
-{
-    for(uint64_t i=0;i<tok->merge_count;i++)
-    {
-        if(strcmp(
-            tok->merges[i].left,
-            a
-        )==0 &&
-        strcmp(
-            tok->merges[i].right,
-            b
-        )==0)
-        {
-            return i;
-        }
-    }
-    return -1;
-}
+static int merge_rank(const Tokenizer *tok, const char *a, const char *b);
+
 typedef struct
 {
     char *text;
@@ -1266,6 +1343,8 @@ void tokenizer_free(
         free(tok->merges);
     }
     free(tok->special_ids);
+    if (g_tab_owner == tok)
+        free_tables();
     memset(
         tok,
         0,

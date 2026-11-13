@@ -31,10 +31,42 @@ static void on_signal(int sig)
     g_slots_abort = 1;
 }
 
+static void reply_ok(FILE *out, const char *msg)
+{
+    fprintf(out, "%s\n", msg);
+    fflush(out);
+}
+
 static void reply_err(FILE *out, const char *msg)
 {
     fprintf(out, "ERR %s\n", msg);
     fflush(out);
+}
+
+/* Decode the escapes used by RUNE / CONT: \n, \r, \\ (any other escaped char is kept as is). */
+static void unescape_prompt(char *s)
+{
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (*r == '\\' && r[1]) {
+            r++;
+            *w++ = *r == 'n' ? '\n' : *r == 'r' ? '\r' : *r;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
+/* "<ctx> <cache_route> <j> <m> <alpha> <p> <temp> <top_p> <top_k> <max_tokens> <think> [<slide> <keep>]" */
+static int parse_config(const char *s, SlotConfig *cf)
+{
+    slot_config_defaults(cf);
+    int n = sscanf(s, "%zu %d %d %d %f %f %f %f %d %d %d %d %d",
+                   &cf->context_length, &cf->cache_route, &cf->route_j, &cf->route_m,
+                   &cf->route_alpha, &cf->route_p, &cf->temperature, &cf->top_p,
+                   &cf->top_k, &cf->max_tokens, &cf->think, &cf->slide, &cf->keep);
+    return n == 11 || n == 13 ? 0 : -1;
 }
 
 static void *client_main(void *arg)
@@ -54,24 +86,34 @@ static void *client_main(void *arg)
         if (strncmp(line, "CREATE ", 7) == 0) {
             if (id >= 0) { reply_err(out, "slot already created"); continue; }
             SlotConfig cf;
-            int n = sscanf(line + 7, "%zu %d %d %d %f %f %f %f %d %d %d",
-                           &cf.context_length, &cf.cache_route, &cf.route_j, &cf.route_m,
-                           &cf.route_alpha, &cf.route_p, &cf.temperature, &cf.top_p,
-                           &cf.top_k, &cf.max_tokens, &cf.think);
-            if (n != 11) { reply_err(out, "malformed CREATE"); continue; }
+            if (parse_config(line + 7, &cf) != 0) { reply_err(out, "malformed CREATE"); continue; }
             const char *err = slot_config_check(&cf);
             if (err) { reply_err(out, err); continue; }
             id = slot_create(g_sm, &cf);
             if (id < 0) { reply_err(out, "could not create slot (no free slot or out of memory; see server log)"); continue; }
             fprintf(out, "OK %d\n", id);
             fflush(out);
-        } else if (strncmp(line, "RUN ", 4) == 0) {
-            if (id < 0) { reply_err(out, "no slot"); continue; }
-            if (len - 4 > ROASTER_MAX_PROMPT) { reply_err(out, "prompt too long"); continue; }
+        } else if (strncmp(line, "STOP ", 5) == 0) {
+            /* Works from any connection, also one that owns no slot. */
+            fprintf(out, "OK %d\n", slot_stop(g_sm, atoi(line + 5)));
+            fflush(out);
+        } else if (id < 0) {
+            reply_err(out, "no slot");
+        } else if (strncmp(line, "RUN ", 4) == 0 || strncmp(line, "RUNE ", 5) == 0 ||
+                   strncmp(line, "CONT ", 5) == 0) {
+            int cont = line[0] == 'C';
+            int escaped = cont || line[3] == 'E';
+            char *prompt = line + (line[3] == ' ' ? 4 : 5);
+            if (escaped)
+                unescape_prompt(prompt);
+            if (strlen(prompt) > ROASTER_MAX_PROMPT) { reply_err(out, "prompt too long"); continue; }
             char *info = NULL;
             size_t info_len = 0;
             FILE *inf = open_memstream(&info, &info_len);
-            slot_run(g_sm, id, line + 4, out, inf);
+            if (cont)
+                slot_continue(g_sm, id, prompt, out, inf);
+            else
+                slot_run(g_sm, id, prompt, out, inf);
             fclose(inf);
             fputc('\0', out);
             fwrite(info, 1, info_len, out);
@@ -80,6 +122,67 @@ static void *client_main(void *arg)
             free(info);
             if (ferror(out))
                 break;
+        } else if (strncmp(line, "SAVE ", 5) == 0) {
+            char e[512];
+            size_t bytes = 0;
+            if (slot_save_dir(g_sm, id, line + 5, &bytes, e, sizeof e) != 0) reply_err(out, e);
+            else { fprintf(out, "OK bytes=%zu\n", bytes); fflush(out); }
+        } else if (strncmp(line, "RESTORE ", 8) == 0) {
+            char e[512];
+            if (slot_restore_dir(g_sm, id, line + 8, e, sizeof e) != 0) reply_err(out, e);
+            else reply_ok(out, "OK");
+        } else if (strncmp(line, "SYS ", 4) == 0) {
+            char e[160];
+            char *text = line + 4;
+            unescape_prompt(text);
+            if (strlen(text) > ROASTER_MAX_PROMPT) reply_err(out, "system prompt too long");
+            else if (slot_set_system(g_sm, id, text, e, sizeof e) != 0) reply_err(out, e);
+            else reply_ok(out, "OK");
+        } else if (strncmp(line, "SET ", 4) == 0) {
+            SlotConfig sc;
+            slot_config_defaults(&sc);
+            char e[160];
+            if (sscanf(line + 4, "%f %f %d %d %d", &sc.temperature, &sc.top_p, &sc.top_k,
+                       &sc.max_tokens, &sc.think) != 5)
+                reply_err(out, "malformed SET");
+            else if (slot_update(g_sm, id, &sc, e, sizeof e) != 0)
+                reply_err(out, e);
+            else
+                reply_ok(out, "OK");
+        } else if (strncmp(line, "CONFIG ", 7) == 0) {
+            SlotConfig cf;
+            char e[256];
+            if (parse_config(line + 7, &cf) != 0) reply_err(out, "malformed CONFIG");
+            else if (slot_configure(g_sm, id, &cf, e, sizeof e) != 0) reply_err(out, e);
+            else reply_ok(out, "OK");
+        } else if (strcmp(line, "RESET") == 0) {
+            char e[160];
+            if (slot_reset(g_sm, id, e, sizeof e) != 0) reply_err(out, e);
+            else reply_ok(out, "OK");
+        } else if (strncmp(line, "UNLOAD", 6) == 0) {
+            char e[256];
+            if (slot_unload(g_sm, id, strstr(line + 6, "DISCARD") != NULL, e, sizeof e) != 0) reply_err(out, e);
+            else reply_ok(out, "OK");
+        } else if (strcmp(line, "LOAD") == 0) {
+            char e[160];
+            if (slot_load(g_sm, id, e, sizeof e) != 0) reply_err(out, e);
+            else reply_ok(out, "OK");
+        } else if (strcmp(line, "INFO") == 0) {
+            SlotInfo si;
+            if (slot_info(g_sm, id, &si) != 0) {
+                reply_err(out, "invalid slot");
+            } else {
+                const SlotConfig *c = &si.config;
+                fprintf(out, "OK loaded=%d position=%zu context=%zu ram=%zu state=%zu broken=%d busy=%d "
+                             "window=%zu spilled=%zu spill_bytes=%zu pinned=%zu slide=%d keep=%d cache_route=%d "
+                             "route_j=%d route_m=%d route_alpha=%.9g route_p=%.9g temp=%.9g top_p=%.9g "
+                             "top_k=%d max_tokens=%d think=%d\n",
+                        si.loaded, si.position, si.context_length, si.ram_bytes, si.state_bytes,
+                        si.broken, si.running, si.window, si.spilled, si.spill_bytes, si.pinned, c->slide, c->keep,
+                        c->cache_route, c->route_j, c->route_m, c->route_alpha, c->route_p,
+                        c->temperature, c->top_p, c->top_k, c->max_tokens, c->think);
+                fflush(out);
+            }
         } else {
             reply_err(out, "unknown command");
         }
